@@ -25,7 +25,11 @@ jobs:
       - id: labels
         name: Gather List
         run: |
-          labels="$(.github/workflows/pr-labels.sh)"
+          git fetch --quiet https://github.com/docker-library/official-images.git master
+          labels="$(git diff --numstat FETCH_HEAD...HEAD -- library/ | cut -d$'\t' -f3-)"
+          if [ -n "$labels" ] && newImages="$(git diff --name-only --diff-filter=A FETCH_HEAD...HEAD -- $labels)" && [ -n "$newImages" ]; then
+            labels+=$'\nnew-image'
+          fi
           labels="$(jq -Rsc 'rtrimstr("\n") | split("\n") | { labels: ., count: length }' <<<"$labels")"
           jq . <<<"$labels"
           echo "::set-output name=labels::$labels"
@@ -54,19 +58,19 @@ jobs:
           fetch-depth: 0
       - name: Prepare Environment
         run: |
-          git clone --depth 1 https://github.com/docker-library/bashbrew.git -b master ~/bashbrew
-          ~/bashbrew/bashbrew.sh --version > /dev/null
+          # this mimics "test-pr.sh", but without running repo-local scripts (to avoid CVE-2020-15228 via the scripts being updated to write nasty things to $GITHUB_ENV)
+          bashbrewVersion="$(< bashbrew-version)"
+          docker build --pull --tag oisupport/bashbrew:base "https://github.com/docker-library/bashbrew.git#v$bashbrewVersion"
+          docker build --tag oisupport/bashbrew:diff-pr .
       - id: diff
         name: Generate Diff
         env:
           GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          export PATH="$HOME/bashbrew/bin:$PATH"
-          bashbrew --version > /dev/null
-          diff="$(./diff-pr.sh "$GITHUB_PR_NUMBER" | tee /dev/stderr)"
+          docker run --rm --read-only --tmpfs /tmp oisupport/bashbrew:diff-pr ./diff-pr.sh "$GITHUB_PR_NUMBER" | tee "$GITHUB_WORKSPACE/oi-pr.diff"
           set +x
-          json="$(jq <<<"$diff" -Rcs '{ diff: ., length: length }')"
-          echo "::set-output name=diff::$json"
+          length="$(jq -Rcs 'length' "$GITHUB_WORKSPACE/oi-pr.diff")"
+          echo "::set-output name=length::$length"
       - name: Comment
         uses: actions/github-script@v3
         with:
@@ -94,8 +98,9 @@ jobs:
               }
             }
             if (needNewComment) {
-              const data = ${{ steps.diff.outputs.diff }};
-              const body = "<details>\n<summary>" + commentText + "</summary>\n\n```diff\n" + data.diff + "\n```\n\n</details>";
+              const fs = require('fs');
+              const diff = fs.readFileSync(process.env.GITHUB_WORKSPACE + '/oi-pr.diff');
+              const body = "<details>\n<summary>" + commentText + "</summary>\n\n```diff\n" + diff + "\n```\n\n</details>";
               await github.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -103,4 +108,4 @@ jobs:
                 body: body,
               });
             }
-        if: fromJSON(steps.diff.outputs.diff).length > 0
+        if: fromJSON(steps.diff.outputs.length) > 0
